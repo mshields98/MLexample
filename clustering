@@ -1,0 +1,166 @@
+## This is the cluster code for Persona Analysis 
+
+
+/* Compose the needed data from surveys and transformations above*/ 
+
+select 
+    s.enrollment_id
+    ,s.course_code
+    ,program_start_date
+    ,graduation_date
+    ,ifnull(s.outcome, 'inactive') as outcome_cleaned
+    ,grad_max_enroll_date
+    ,case when grad_max_enroll_date <= '2025-05-01' then 1 else 0 end as mature_cohort_flag
+    ,race
+    ,age
+    ,m.motivation_resp
+    ,w.why_chegg_resp
+    ,r.referral_resp
+    ,rf.cleaned_famil_respon as familiarity_resp
+    ,hs.help_seeking_category
+    ,l.learning_style
+    ,pe.prior_ex_response
+    ,o.online_envi_ex
+from full_survey_data s
+left join motivi_df m 
+on m.enrollment_id = s.enrollment_id
+left join why_chegg_df w 
+on w.enrollment_id = s.enrollment_id
+left join referral_df r
+on r.enrollment_id = s.enrollment_id
+left join famili_cleaned_df rf
+on rf.enrollment_id = s.enrollment_id
+left join df_hs_cleaned hs 
+on hs.enrollment_id = s.enrollment_id
+left join learning_style_df l
+on l.enrollment_id = s.enrollment_id
+left join prior_ex_df pe 
+on pe.enrollment_id = s.enrollment_id
+left join dataframe_100 o
+on o.enrollment_id = s.enrollment_id
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
+order by 1
+
+
+df= analysis_df
+
+##df.info() ## Looks for nulls and data types 
+##df.head(10) ##shows the first 10 rows 
+##df.describe() ##runs descriptive stats and only works for numeric 
+##df.describe(include = 'all') ## shows everything even for ojects 
+df.nunique()
+df.isnull().sum() #number of nulls per col
+
+##Value cts function 
+for col in df.columns:
+    print (f"\n--- {col}---")
+    print (df[col].value_counts(dropna=False))
+
+##Look at enrollment id_288927 and 288646 -- they seem to appear over 200 times?
+##-------> That data was weird, 
+## for the last few items, there a alot of nulls likely because this is new data and was under the EV restriction 
+## to handle those I will look at that data as its own sample resulting in to samples to test
+
+bad_enrollment_ids = ['288927', '288646'] #list the data we want to remove 
+
+df_cleaned = df[~df['enrollment_id'].isin(bad_enrollment_ids)] #create new cleaned df 
+df_cleaned.nunique() #check to makes sure the bads are removed
+
+
+## Because of the messy data I will be running this is two sample sets, one that is more full
+## and includes the most data and one that is smaller but has the last high null response fields. 
+
+col_names_df_cleaned = df_cleaned.columns.tolist()
+print(col_names_df_cleaned)
+
+df_main = df_cleaned[['enrollment_id', 'course_code', 'program_start_date', 'graduation_date', 'outcome_cleaned', 'grad_max_enroll_date', 'mature_cohort_flag', 'race', 'age', 'motivation_resp', 'why_chegg_resp', 'referral_resp', 'familiarity_resp', 'help_seeking_category']]
+df_new = df_cleaned[['enrollment_id', 'course_code', 'program_start_date', 'graduation_date', 'outcome_cleaned', 'grad_max_enroll_date', 'mature_cohort_flag', 'race', 'age', 'motivation_resp', 'why_chegg_resp', 'referral_resp', 'familiarity_resp', 'help_seeking_category', 'learning_style', 'prior_ex_response', 'online_envi_ex']]
+
+
+##HOT ENCODE THE DATA#####
+
+df_main_encoded = pd.get_dummies(df_main, columns= [ 'motivation_resp', 'why_chegg_resp', 'referral_resp', 'familiarity_resp', 'help_seeking_category'])
+df_new_encoded= pd.get_dummies(df_new, columns= [ 'motivation_resp', 'why_chegg_resp', 'referral_resp', 'familiarity_resp', 'help_seeking_category', 'learning_style', 'prior_ex_response', 'online_envi_ex'])
+
+#PS these are all numberic and were not joined back to enrollment ID yet 
+
+df_main_encoded.head()
+dc_cols= df_main_encoded.columns.tolist()
+
+
+## Do a demensionality Reduction - this will help reduce many dummys into similar groups 
+
+##First you should standarize the data this because reduction methods are really sensitive to this 
+
+from sklearn.preprocessing import StandardScaler
+
+X = df_main_encoded.drop(['enrollment_id','course_code', 'program_start_date', 'graduation_date', 'outcome_cleaned', 'grad_max_enroll_date', 'mature_cohort_flag', 'race','age' ], axis=1)  # keep only numeric survey vars
+scaler = StandardScaler()
+main_df_scaled = scaler.fit_transform(X)
+
+Y = df_main_encoded.drop(['enrollment_id','course_code', 'program_start_date', 'graduation_date', 'outcome_cleaned', 'grad_max_enroll_date', 'mature_cohort_flag', 'race', 'age'], axis=1)  # keep only numeric survey vars
+scaler = StandardScaler()
+new_df_scaled = scaler.fit_transform(Y)
+
+###RUn the PCA (Princple Componet Analsys ) this will help us determine the ideal num of compo to include
+
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+pca = PCA(n_components=None)
+X_pca = pca.fit_transform(main_df_scaled)
+
+#Get Componet values 
+loadings = pd.DataFrame(pca.components_.T, index=X.columns, columns=[f'PC{i+1}' for i in range(len(pca.components_))])
+top_features = loadings.abs().sort_values(by='PC1', ascending=False).head(10)
+
+
+# Plot explained variance to choose how many components to keep
+plt.figure(figsize=(10, 6))
+sns.lineplot(x=range(1, len(pca.explained_variance_ratio_)+1), y=pca.explained_variance_ratio_.cumsum(), marker='o')
+plt.axhline(0.80, color='red', linestyle='--')  # example threshold for 80% explained
+plt.xlabel('Number of Components')
+plt.ylabel('Cumulative Explained Variance')
+plt.title('PCA - Variance Explained')
+plt.show()
+print(top_features)
+
+
+##K was 5 
+
+## Now we start the clustering 
+
+#Start with an elbow plot to see if there are an optimal number of clusters
+
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+
+wcss = []  # Within-cluster sum of squares
+
+for i in range(2, 15):
+    kmeans = KMeans(n_clusters=i, random_state=42)
+    kmeans.fit(X_pca)
+    wcss.append(kmeans.inertia_)
+
+plt.plot(range(2, 15), wcss, marker='o')
+plt.title("Elbow Method")
+plt.xlabel("Number of Clusters")
+plt.ylabel("WCSS")
+plt.show()
+
+
+
+## Results suggest around 5-6 clusters -- doing 5 for conserivitabe approach 
+optimal_k = 5
+
+### Make the clusters with fit KMeans 
+
+kmeans = KMeans(n_clusters=optimal_k, random_state=42)
+clusters = kmeans.fit_predict(X_pca)
+
+df_clustered_main = df_main_encoded.copy()
+df_clustered_main['cluster'] = clusters
+df_clustered_main['cluster'].value_counts()
+df_clustered_main.groupby('cluster').mean(numeric_only=True)
+
